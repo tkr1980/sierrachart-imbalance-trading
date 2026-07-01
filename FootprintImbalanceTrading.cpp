@@ -7,24 +7,6 @@
 // Name the custom study DLL
 SCDLLName("Footprint Imbalance Trading Study")
 
-// Helper function to search the VAP container for a specific price level (in ticks)
-s_VolumeAtPriceV2* FindVAPElementAtPrice(SCStudyInterfaceRef sc, int BarIndex, int TargetPriceInTicks)
-{
-	int PriceLevels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(BarIndex);
-	for (int i = 0; i < PriceLevels; ++i)
-	{
-		s_VolumeAtPriceV2 *p_Element = nullptr;
-		if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, i, &p_Element))
-		{
-			if (p_Element->PriceInTicks == TargetPriceInTicks)
-			{
-				return p_Element;
-			}
-		}
-	}
-	return nullptr;
-}
-
 // Drawing helper to draw highlight or marker at a specific price level
 void DrawImbalanceHighlight(SCStudyInterfaceRef sc, int BarIndex, double Price, COLORREF Color, int LineNumber, int HighlightStyle)
 {
@@ -292,7 +274,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	std::vector<bool> buy_imbalances(PriceLevels, false);
 	std::vector<bool> sell_imbalances(PriceLevels, false);
 
-	// Pass 1: Detect individual imbalances and draw highlights (Gap-tolerant check)
+	// Pass 1: Detect individual imbalances and draw highlights (O(1) lookup since VAP is sorted by price)
 	for (int PriceIndex = 0; PriceIndex < PriceLevels; ++PriceIndex)
 	{
 		s_VolumeAtPriceV2 *p_Curr = nullptr;
@@ -303,11 +285,22 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		int LineNum = BaseLineNum + (BarIndex * MaxDrawingOffsets) + PriceIndex;
 
 		// 1. Check buying imbalance: Ask volume at current price vs Bid volume at price below (exactly P - 1 tick)
-		// If the price level exactly 1 tick below does not exist in the VAP container, its bid volume is treated as 0.
-		s_VolumeAtPriceV2 *p_Prev = FindVAPElementAtPrice(sc, BarIndex, p_Curr->PriceInTicks - 1);
-		double bid_vol = p_Prev ? p_Prev->BidVolume : 0.0;
+		// Because the VAP container is sorted by price in ascending order, if the level exactly 1 tick below exists,
+		// it MUST be located at index [PriceIndex - 1]. Otherwise, its volume is 0.
+		double bid_vol = 0.0;
+		if (PriceIndex > 0)
+		{
+			s_VolumeAtPriceV2 *p_Prev = nullptr;
+			if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex - 1, &p_Prev))
+			{
+				if (p_Prev->PriceInTicks == p_Curr->PriceInTicks - 1)
+				{
+					bid_vol = p_Prev->BidVolume;
+				}
+			}
+		}
+		
 		double ask_vol = p_Curr->AskVolume;
-
 		if (ask_vol >= bid_vol * ImbalanceRatio && ask_vol >= MinVolume)
 		{
 			buy_imbalances[PriceIndex] = true;
@@ -315,11 +308,22 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		}
 
 		// 2. Check selling imbalance: Bid volume at current price vs Ask volume at price above (exactly P + 1 tick)
-		// If the price level exactly 1 tick above does not exist in the VAP container, its ask volume is treated as 0.
-		s_VolumeAtPriceV2 *p_Next = FindVAPElementAtPrice(sc, BarIndex, p_Curr->PriceInTicks + 1);
-		double next_ask_vol = p_Next ? p_Next->AskVolume : 0.0;
-		double current_bid_vol = p_Curr->BidVolume;
+		// Because the VAP container is sorted by price in ascending order, if the level exactly 1 tick above exists,
+		// it MUST be located at index [PriceIndex + 1]. Otherwise, its volume is 0.
+		double next_ask_vol = 0.0;
+		if (PriceIndex < PriceLevels - 1)
+		{
+			s_VolumeAtPriceV2 *p_Next = nullptr;
+			if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex + 1, &p_Next))
+			{
+				if (p_Next->PriceInTicks == p_Curr->PriceInTicks + 1)
+				{
+					next_ask_vol = p_Next->AskVolume;
+				}
+			}
+		}
 
+		double current_bid_vol = p_Curr->BidVolume;
 		if (current_bid_vol >= next_ask_vol * ImbalanceRatio && current_bid_vol >= MinVolume)
 		{
 			sell_imbalances[PriceIndex] = true;
