@@ -137,6 +137,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		sc.SupportAttachedOrdersForTrading = true;
 		sc.SendOrdersToTradeService = false; // Safe default; overridden by "Enable Automated Trading" each bar below
 		sc.MaintainTradeStatisticsAndTradesData = true;
+		sc.MaximumPositionAllowed = 10000; // Allow larger position sizes for dynamic trading quantities
 
 		return;
 	}
