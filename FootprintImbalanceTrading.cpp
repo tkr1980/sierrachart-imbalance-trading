@@ -15,7 +15,7 @@ void DrawImbalanceHighlight(SCStudyInterfaceRef sc, int BarIndex, double Price, 
 	Tool.ChartNumber = sc.ChartNumber;
 	Tool.LineNumber = LineNumber;
 	Tool.AddMethod = UTAM_ADD_OR_ADJUST;
-	
+
 	if (HighlightStyle == 0) // Rectangle Highlight
 	{
 		Tool.DrawingType = DRAWING_RECTANGLEHIGHLIGHT;
@@ -23,7 +23,7 @@ void DrawImbalanceHighlight(SCStudyInterfaceRef sc, int BarIndex, double Price, 
 		Tool.EndIndex = BarIndex;
 		Tool.BeginValue = static_cast<t_ChartArrayDataType>(Price);
 		Tool.EndValue = static_cast<t_ChartArrayDataType>(Price + sc.TickSize); // Height is 1 tick
-		
+
 		Tool.Color = Color;             // Outline color
 		Tool.SecondaryColor = Color;     // Fill color
 		Tool.TransparencyLevel = 75;    // Semi-transparent
@@ -46,13 +46,13 @@ void DrawImbalanceHighlight(SCStudyInterfaceRef sc, int BarIndex, double Price, 
 			Tool.BeginValue = static_cast<t_ChartArrayDataType>(Price + sc.TickSize * 0.8);
 			Tool.MarkerType = MARKER_TRIANGLEDOWN;
 		}
-		
+
 		Tool.Color = Color;             // Outline color
 		Tool.SecondaryColor = Color;     // Fill color (solid foreground)
 		Tool.TransparencyLevel = 0;     // Opaque so it shows on top of solid backgrounds
 		Tool.MarkerSize = 8;
 	}
-	
+
 	sc.UseTool(Tool);
 }
 
@@ -65,14 +65,14 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		sc.StudyDescription = "Detects diagonal footprint bid/ask volume imbalances, highlights them, and executes trades with dynamic sizing based on asset class.";
 		sc.GraphRegion = 0; // Draw on the main chart
 		sc.AutoLoop = 1;    // Automatic looping enabled
-		
+
 		// Configure Subgraphs for signal visualization
 		sc.Subgraph[0].Name = "Stacked Buy Imbalance Signal";
 		sc.Subgraph[0].DrawStyle = DRAWSTYLE_POINT;
 		sc.Subgraph[0].PrimaryColor = RGB(0, 255, 0);
 		sc.Subgraph[0].LineWidth = 4;
 		sc.Subgraph[0].DrawZeros = 0; // Prevent plotting 0.0 values from squishing the chart scale
-		
+
 		sc.Subgraph[1].Name = "Stacked Sell Imbalance Signal";
 		sc.Subgraph[1].DrawStyle = DRAWSTYLE_POINT;
 		sc.Subgraph[1].PrimaryColor = RGB(255, 0, 0);
@@ -127,18 +127,24 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		sc.Input[14].Name = "Highlight Style (0=Rectangle, 1=Triangle)";
 		sc.Input[14].SetInt(1); // Default to 1 (Triangle Marker) for foreground overlay visibility
 
+		// Raise this on higher timeframes / wide-range bars where a bar can span
+		// more than 500 footprint price levels (the old fixed cap left stale
+		// highlights undeleted once a bar exceeded it).
+		sc.Input[15].Name = "Max Drawing Offsets Per Bar (raise for higher TF / wide-range bars)";
+		sc.Input[15].SetInt(2000);
+
 		// Trading configuration flags
 		sc.AllowMultipleEntriesInSameDirection = false;
 		sc.AllowOnlyOneTradePerBar = true;
 		sc.SupportAttachedOrdersForTrading = true;
-		sc.SendOrdersToTradeService = false; // Set to true inside trade window for live execution
+		sc.SendOrdersToTradeService = false; // Safe default; overridden by "Enable Automated Trading" each bar below
 		sc.MaintainTradeStatisticsAndTradesData = true;
 
 		return;
 	}
 
 	// Section 2 - Data Processing
-	
+
 	// Verify that Volume-At-Price (VAP) data is available
 	if (static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars()) < sc.ArraySize)
 		return;
@@ -154,12 +160,18 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	int AlertSoundNum = sc.Input[7].GetAlertSoundNumber();
 	int BaseLineNum = sc.Input[8].GetInt();
 	int MaxDays = sc.Input[9].GetInt();
-	
+
 	bool UseDynamicThreshold = sc.Input[10].GetYesNo();
 	float VolumeMultiplier = sc.Input[11].GetFloat();
 	bool UseDynamicSizing = sc.Input[12].GetYesNo();
 	int BaseQuantity = sc.Input[13].GetInt();
 	int HighlightStyle = sc.Input[14].GetInt();
+	int MaxDrawingOffsets = sc.Input[15].GetInt();
+
+	// "Enable Automated Trading" now directly controls live order routing —
+	// previously SendOrdersToTradeService was hardcoded false, so orders
+	// never actually reached the trade service regardless of this input.
+	sc.SendOrdersToTradeService = EnableTrading;
 
 	// Avoid recalculating very old historical bars to preserve performance
 	SCDateTimeMS StartDateTime = sc.BaseDateTimeIn[sc.ArraySize - 1];
@@ -176,7 +188,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		double total_level_volume = 0;
 		int count = 0;
 		int start_idx = (BarIndex >= 100) ? (BarIndex - 100) : 0;
-		
+
 		for (int i = start_idx; i < BarIndex; ++i)
 		{
 			int levels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
@@ -186,7 +198,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 				count++;
 			}
 		}
-		
+
 		if (count > 0)
 		{
 			double avg_volume_per_level = total_level_volume / count;
@@ -205,20 +217,22 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	{
 		std::string Symbol(sc.Symbol.GetChars());
 		std::transform(Symbol.begin(), Symbol.end(), Symbol.begin(), ::toupper);
-		
-		// Check if micro contract (MES, MNQ, MGC, MCL, MSI, etc.)
-		bool is_micro = (Symbol.find("MES") != std::string::npos || 
-		                 Symbol.find("MNQ") != std::string::npos || 
-		                 Symbol.find("MGC") != std::string::npos || 
-		                 Symbol.find("MCL") != std::string::npos || 
-		                 Symbol.find("MSI") != std::string::npos);
-		
+
+		// Check if micro contract (MES, MNQ, MGC, MCL, SIL, MYM).
+		// Note: CME's micro silver symbol is "SIL", not "MSI" — there is no "MSI" contract.
+		bool is_micro = (Symbol.find("MES") != std::string::npos ||
+		                 Symbol.find("MNQ") != std::string::npos ||
+		                 Symbol.find("MGC") != std::string::npos ||
+		                 Symbol.find("MCL") != std::string::npos ||
+		                 Symbol.find("SIL") != std::string::npos ||
+		                 Symbol.find("MYM") != std::string::npos);
+
 		int asset_multiplier = 1;
 		if (Symbol.find("GC") != std::string::npos)       // Gold (GC, MGC)
 		{
 			asset_multiplier = 2;
 		}
-		else if (Symbol.find("SI") != std::string::npos)  // Silver (SI, MSI)
+		else if (Symbol.find("SI") != std::string::npos)  // Silver (SI, SIL)
 		{
 			asset_multiplier = 3;
 		}
@@ -238,9 +252,9 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		{
 			asset_multiplier = 1;
 		}
-		
+
 		TradeQuantity = BaseQuantity * asset_multiplier;
-		
+
 		// Scale up by 10x for micro contracts to match risk profile of standard contracts
 		if (is_micro)
 		{
@@ -249,9 +263,9 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	}
 
 	// Explicitly clear all potential drawings for this bar from previous calculations
-	for (int Offset = 0; Offset < 500; ++Offset)
+	for (int Offset = 0; Offset < MaxDrawingOffsets; ++Offset)
 	{
-		sc.DeleteUserDrawnACSDrawing(sc.ChartNumber, BaseLineNum + (BarIndex * 1000) + Offset);
+		sc.DeleteUserDrawnACSDrawing(sc.ChartNumber, BaseLineNum + (BarIndex * MaxDrawingOffsets) + Offset);
 	}
 
 	int PriceLevels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(BarIndex);
@@ -274,7 +288,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 			continue;
 
 		double Price = p_Curr->PriceInTicks * sc.TickSize;
-		int LineNum = BaseLineNum + (BarIndex * 1000) + PriceIndex;
+		int LineNum = BaseLineNum + (BarIndex * MaxDrawingOffsets) + PriceIndex;
 
 		// 1. Check buying imbalance: Ask volume at current price vs Bid volume at price below
 		if (PriceIndex > 0)
@@ -374,16 +388,42 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	// Only trade on the real-time active bar
 	if (BarIndex == sc.ArraySize - 1)
 	{
-		// Use persistent state variables to ensure we only place one trade per bar
-		int& LastTradedBar = sc.GetPersistentInt(0);
-		
-		if (LastTradedBar != BarIndex)
-		{
-			s_SCPositionData Position;
-			sc.GetTradePosition(Position);
+		// Both directions stacked on the same bar is an ambiguous read (e.g. a wide
+		// bar sweeping both extremes) — skip entries/exits rather than silently
+		// favoring buy over sell.
+		bool conflicting_signal = stacked_buy_found && stacked_sell_found;
 
-			// Check if we are flat before executing a new trade
-			if (Position.PositionQuantity == 0)
+		s_SCPositionData Position;
+		sc.GetTradePosition(Position);
+
+		if (Position.PositionQuantity != 0)
+		{
+			// Signal-based exit: flatten if an opposing stacked imbalance appears
+			// while in a position, instead of relying solely on the stop/target bracket.
+			bool exit_long = (Position.PositionQuantity > 0) && stacked_sell_found;
+			bool exit_short = (Position.PositionQuantity < 0) && stacked_buy_found;
+
+			if (!conflicting_signal && (exit_long || exit_short))
+			{
+				if (EnableTrading)
+				{
+					sc.FlattenPosition();
+				}
+
+				if (AlertSoundNum > 0)
+				{
+					SCString Msg;
+					Msg.Format("Opposing stacked imbalance — flattening position (was Qty: %d)!", Position.PositionQuantity);
+					sc.SetAlert(AlertSoundNum - 1, Msg);
+				}
+			}
+		}
+		else
+		{
+			// Use persistent state variables to ensure we only place one trade per bar
+			int& LastTradedBar = sc.GetPersistentInt(0);
+
+			if (LastTradedBar != BarIndex && !conflicting_signal)
 			{
 				bool order_placed = false;
 				s_SCNewOrder NewOrder;
@@ -410,7 +450,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 					{
 						sc.BuyEntry(NewOrder);
 					}
-					
+
 					if (AlertSoundNum > 0)
 					{
 						SCString Msg;
@@ -425,7 +465,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 					{
 						sc.SellEntry(NewOrder);
 					}
-					
+
 					if (AlertSoundNum > 0)
 					{
 						SCString Msg;
