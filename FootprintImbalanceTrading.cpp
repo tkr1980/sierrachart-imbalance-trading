@@ -166,7 +166,16 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	int HighlightStyle = sc.Input[14].GetInt();
 	int MaxDrawingOffsets = sc.Input[15].GetInt();
 
-	sc.SendOrdersToTradeService = EnableTrading;
+	// Resolve SendOrdersToTradeService based on whether Trade Simulation Mode is enabled.
+	// If Trade Simulation is ON, SendOrdersToTradeService MUST be false, otherwise Sierra Chart blocks the order.
+	if (sc.GlobalTradeSimulationIsOn != 0)
+	{
+		sc.SendOrdersToTradeService = false; // Directs orders to the internal simulation account (Sim1)
+	}
+	else
+	{
+		sc.SendOrdersToTradeService = EnableTrading; // Directs orders to the live broker service if enabled
+	}
 
 	// Avoid recalculating very old historical bars to preserve performance
 	SCDateTimeMS StartDateTime = sc.BaseDateTimeIn[sc.ArraySize - 1];
