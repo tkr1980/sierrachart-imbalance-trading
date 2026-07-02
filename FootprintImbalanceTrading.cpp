@@ -64,7 +64,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		sc.GraphName = "Footprint Imbalance & Stacked Trading";
 		sc.StudyDescription = "Detects diagonal footprint bid/ask volume imbalances, highlights them, and executes trades with dynamic sizing based on asset class.";
 		sc.GraphRegion = 0; // Draw on the main chart
-		sc.AutoLoop = 1;    // Automatic looping enabled
+		sc.AutoLoop = 0;    // Manual looping enabled for ultra-high performance on large charts
 		
 		// Configure Subgraphs for signal visualization
 		sc.Subgraph[0].Name = "Stacked Buy Imbalance Signal";
@@ -168,7 +168,6 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	int MaxDrawingOffsets = sc.Input[15].GetInt();
 
 	// Resolve SendOrdersToTradeService based on whether Trade Simulation Mode is enabled.
-	// If Trade Simulation is ON, SendOrdersToTradeService MUST be false, otherwise Sierra Chart blocks the order.
 	if (sc.GlobalTradeSimulationIsOn != 0)
 	{
 		sc.SendOrdersToTradeService = false; // Directs orders to the internal simulation account (Sim1)
@@ -176,44 +175,6 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 	else
 	{
 		sc.SendOrdersToTradeService = EnableTrading; // Directs orders to the live broker service if enabled
-	}
-
-	// Avoid recalculating very old historical bars to preserve performance
-	SCDateTimeMS StartDateTime = sc.BaseDateTimeIn[sc.ArraySize - 1];
-	StartDateTime.SubtractDays(MaxDays);
-	if (sc.BaseDateTimeIn[sc.Index] < StartDateTime)
-		return;
-
-	int BarIndex = sc.Index;
-
-	// Calculate Dynamic Minimum Volume Threshold based on historical average volume per price level
-	int MinVolume = StaticMinVolume;
-	if (UseDynamicThreshold)
-	{
-		double total_level_volume = 0;
-		int count = 0;
-		int start_idx = (BarIndex >= 100) ? (BarIndex - 100) : 0;
-		
-		for (int i = start_idx; i < BarIndex; ++i)
-		{
-			int levels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
-			if (levels > 0)
-			{
-				total_level_volume += (sc.Volume[i] / static_cast<double>(levels));
-				count++;
-			}
-		}
-		
-		if (count > 0)
-		{
-			double avg_volume_per_level = total_level_volume / count;
-			MinVolume = static_cast<int>(avg_volume_per_level * VolumeMultiplier);
-			if (MinVolume < 1) MinVolume = 1; // Safety boundary
-		}
-		else
-		{
-			MinVolume = StaticMinVolume; // Fallback
-		}
 	}
 
 	// Calculate Dynamic Position Sizing (Contract Quantity)
@@ -266,228 +227,268 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		}
 	}
 
-	// Explicitly clear all potential drawings for this bar from previous calculations.
-	// CRITICAL PERFORMANCE OPTIMIZATION: Only run the deletion loop on the active real-time bar (where footprint changes tick-by-tick).
-	// Running this on thousands of historical bars during full recalculations freezes the UI thread.
-	if (BarIndex == sc.ArraySize - 1)
+	// Find the start index for our calculation loop (MaxDays back)
+	int StartIndex = 0;
+	if (MaxDays > 0)
 	{
-		for (int Offset = 0; Offset < MaxDrawingOffsets; ++Offset)
+		SCDateTimeMS StartDateTime = sc.BaseDateTimeIn[sc.ArraySize - 1];
+		StartDateTime.SubtractDays(MaxDays);
+		
+		// Search backwards to find the first bar within the time window
+		for (int i = sc.ArraySize - 1; i >= 0; --i)
 		{
-			sc.DeleteUserDrawnACSDrawing(sc.ChartNumber, BaseLineNum + (BarIndex * MaxDrawingOffsets) + Offset);
+			if (sc.BaseDateTimeIn[i] < StartDateTime)
+			{
+				StartIndex = i + 1;
+				break;
+			}
 		}
 	}
 
-	int PriceLevels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(BarIndex);
-	if (PriceLevels <= 0)
-		return;
-
-	// Reset signal subgraphs
-	sc.Subgraph[0][BarIndex] = 0.0f;
-	sc.Subgraph[1][BarIndex] = 0.0f;
-
-	// Keep track of which price levels have imbalances inside this bar
-	std::vector<bool> buy_imbalances(PriceLevels, false);
-	std::vector<bool> sell_imbalances(PriceLevels, false);
-
-	// Pass 1: Detect individual imbalances and draw highlights (O(1) lookup since VAP is sorted by price)
-	for (int PriceIndex = 0; PriceIndex < PriceLevels; ++PriceIndex)
+	// Main calculation loop (manual looping for ultra performance)
+	for (int BarIndex = StartIndex; BarIndex < sc.ArraySize; ++BarIndex)
 	{
-		s_VolumeAtPriceV2 *p_Curr = nullptr;
-		if (!sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex, &p_Curr))
+		// Calculate Dynamic Minimum Volume Threshold based on historical average volume per price level
+		int MinVolume = StaticMinVolume;
+		if (UseDynamicThreshold)
+		{
+			double total_level_volume = 0;
+			int count = 0;
+			int start_idx = (BarIndex >= 100) ? (BarIndex - 100) : 0;
+			
+			for (int i = start_idx; i < BarIndex; ++i)
+			{
+				int levels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(i);
+				if (levels > 0)
+				{
+					total_level_volume += (sc.Volume[i] / static_cast<double>(levels));
+					count++;
+				}
+			}
+			
+			if (count > 0)
+			{
+				double avg_volume_per_level = total_level_volume / count;
+				MinVolume = static_cast<int>(avg_volume_per_level * VolumeMultiplier);
+				if (MinVolume < 1) MinVolume = 1; // Safety boundary
+			}
+		}
+
+		// Explicitly clear all potential drawings for this bar from previous calculations.
+		// ONLY do this for the real-time active bar!
+		if (BarIndex == sc.ArraySize - 1)
+		{
+			for (int Offset = 0; Offset < MaxDrawingOffsets; ++Offset)
+			{
+				sc.DeleteUserDrawnACSDrawing(sc.ChartNumber, BaseLineNum + (BarIndex * MaxDrawingOffsets) + Offset);
+			}
+		}
+
+		int PriceLevels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(BarIndex);
+		if (PriceLevels <= 0)
 			continue;
 
-		double Price = p_Curr->PriceInTicks * sc.TickSize;
-		int LineNum = BaseLineNum + (BarIndex * MaxDrawingOffsets) + PriceIndex;
+		// Reset signal subgraphs
+		sc.Subgraph[0][BarIndex] = 0.0f;
+		sc.Subgraph[1][BarIndex] = 0.0f;
 
-		// 1. Check buying imbalance: Ask volume at current price vs Bid volume at price below (exactly P - 1 tick)
-		// Because the VAP container is sorted by price in ascending order, if the level exactly 1 tick below exists,
-		// it MUST be located at index [PriceIndex - 1]. Otherwise, its volume is 0.
-		double bid_vol = 0.0;
-		if (PriceIndex > 0)
+		// Keep track of which price levels have imbalances inside this bar
+		std::vector<bool> buy_imbalances(PriceLevels, false);
+		std::vector<bool> sell_imbalances(PriceLevels, false);
+
+		// Pass 1: Detect individual imbalances and draw highlights (O(1) lookup since VAP is sorted by price)
+		for (int PriceIndex = 0; PriceIndex < PriceLevels; ++PriceIndex)
 		{
-			s_VolumeAtPriceV2 *p_Prev = nullptr;
-			if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex - 1, &p_Prev))
+			s_VolumeAtPriceV2 *p_Curr = nullptr;
+			if (!sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex, &p_Curr))
+				continue;
+
+			double Price = p_Curr->PriceInTicks * sc.TickSize;
+			int LineNum = BaseLineNum + (BarIndex * MaxDrawingOffsets) + PriceIndex;
+
+			// 1. Check buying imbalance
+			double bid_vol = 0.0;
+			if (PriceIndex > 0)
 			{
-				if (p_Prev->PriceInTicks == p_Curr->PriceInTicks - 1)
+				s_VolumeAtPriceV2 *p_Prev = nullptr;
+				if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex - 1, &p_Prev))
 				{
-					bid_vol = p_Prev->BidVolume;
+					if (p_Prev->PriceInTicks == p_Curr->PriceInTicks - 1)
+					{
+						bid_vol = p_Prev->BidVolume;
+					}
 				}
 			}
-		}
-		
-		double ask_vol = p_Curr->AskVolume;
-		if (ask_vol >= bid_vol * ImbalanceRatio && ask_vol >= MinVolume)
-		{
-			buy_imbalances[PriceIndex] = true;
-			DrawImbalanceHighlight(sc, BarIndex, Price, RGB(0, 180, 0), LineNum, HighlightStyle);
-		}
-
-		// 2. Check selling imbalance: Bid volume at current price vs Ask volume at price above (exactly P + 1 tick)
-		// Because the VAP container is sorted by price in ascending order, if the level exactly 1 tick above exists,
-		// it MUST be located at index [PriceIndex + 1]. Otherwise, its volume is 0.
-		double next_ask_vol = 0.0;
-		if (PriceIndex < PriceLevels - 1)
-		{
-			s_VolumeAtPriceV2 *p_Next = nullptr;
-			if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex + 1, &p_Next))
+			
+			double ask_vol = p_Curr->AskVolume;
+			if (ask_vol >= bid_vol * ImbalanceRatio && ask_vol >= MinVolume)
 			{
-				if (p_Next->PriceInTicks == p_Curr->PriceInTicks + 1)
+				buy_imbalances[PriceIndex] = true;
+				DrawImbalanceHighlight(sc, BarIndex, Price, RGB(0, 180, 0), LineNum, HighlightStyle);
+			}
+
+			// 2. Check selling imbalance
+			double next_ask_vol = 0.0;
+			if (PriceIndex < PriceLevels - 1)
+			{
+				s_VolumeAtPriceV2 *p_Next = nullptr;
+				if (sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex + 1, &p_Next))
 				{
-					next_ask_vol = p_Next->AskVolume;
+					if (p_Next->PriceInTicks == p_Curr->PriceInTicks + 1)
+					{
+						next_ask_vol = p_Next->AskVolume;
+					}
 				}
+			}
+
+			double current_bid_vol = p_Curr->BidVolume;
+			if (current_bid_vol >= next_ask_vol * ImbalanceRatio && current_bid_vol >= MinVolume)
+			{
+				sell_imbalances[PriceIndex] = true;
+				DrawImbalanceHighlight(sc, BarIndex, Price, RGB(180, 0, 0), LineNum, HighlightStyle);
 			}
 		}
 
-		double current_bid_vol = p_Curr->BidVolume;
-		if (current_bid_vol >= next_ask_vol * ImbalanceRatio && current_bid_vol >= MinVolume)
+		// Pass 2: Check for stacked imbalances (consecutive price levels)
+		int consecutive_buy_count = 0;
+		int consecutive_sell_count = 0;
+		bool stacked_buy_found = false;
+		bool stacked_sell_found = false;
+		double stacked_buy_price = 0.0;
+		double stacked_sell_price = 0.0;
+
+		for (int PriceIndex = 0; PriceIndex < PriceLevels; ++PriceIndex)
 		{
-			sell_imbalances[PriceIndex] = true;
-			DrawImbalanceHighlight(sc, BarIndex, Price, RGB(180, 0, 0), LineNum, HighlightStyle);
-		}
-	}
+			s_VolumeAtPriceV2 *p_Curr = nullptr;
+			sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex, &p_Curr);
+			double Price = p_Curr->PriceInTicks * sc.TickSize;
 
-	// Pass 2: Check for stacked imbalances (consecutive price levels)
-	int consecutive_buy_count = 0;
-	int consecutive_sell_count = 0;
-	bool stacked_buy_found = false;
-	bool stacked_sell_found = false;
-	double stacked_buy_price = 0.0;
-	double stacked_sell_price = 0.0;
-
-	for (int PriceIndex = 0; PriceIndex < PriceLevels; ++PriceIndex)
-	{
-		s_VolumeAtPriceV2 *p_Curr = nullptr;
-		sc.VolumeAtPriceForBars->GetVAPElementAtIndex(BarIndex, PriceIndex, &p_Curr);
-		double Price = p_Curr->PriceInTicks * sc.TickSize;
-
-		if (buy_imbalances[PriceIndex])
-		{
-			consecutive_buy_count++;
-			if (consecutive_buy_count >= StackedCount)
+			if (buy_imbalances[PriceIndex])
 			{
-				stacked_buy_found = true;
-				stacked_buy_price = Price; // Use the top price level of the stack
-			}
-		}
-		else
-		{
-			consecutive_buy_count = 0;
-		}
-
-		if (sell_imbalances[PriceIndex])
-		{
-			consecutive_sell_count++;
-			if (consecutive_sell_count >= StackedCount)
-			{
-				stacked_sell_found = true;
-				stacked_sell_price = Price; // Use the bottom price level of the stack
-			}
-		}
-		else
-		{
-			consecutive_sell_count = 0;
-		}
-	}
-
-	// Update study subgraphs for visualization (only if found)
-	if (stacked_buy_found)
-	{
-		sc.Subgraph[0][BarIndex] = static_cast<float>(stacked_buy_price);
-	}
-	if (stacked_sell_found)
-	{
-		sc.Subgraph[1][BarIndex] = static_cast<float>(stacked_sell_price);
-	}
-
-	// Section 3 - Automated Order Placement
-	// Only trade on the real-time active bar
-	if (BarIndex == sc.ArraySize - 1)
-	{
-		bool conflicting_signal = stacked_buy_found && stacked_sell_found;
-		s_SCPositionData Position;
-		sc.GetTradePosition(Position);
-
-		if (Position.PositionQuantity != 0)
-		{
-			// Signal-based exit: flatten if an opposing stacked imbalance appears
-			bool exit_long = (Position.PositionQuantity > 0) && stacked_sell_found;
-			bool exit_short = (Position.PositionQuantity < 0) && stacked_buy_found;
-
-			if (!conflicting_signal && (exit_long || exit_short))
-			{
-				if (EnableTrading)
+				consecutive_buy_count++;
+				if (consecutive_buy_count >= StackedCount)
 				{
-					sc.FlattenPosition();
-				}
-
-				if (AlertSoundNum > 0)
-				{
-					SCString Msg;
-					Msg.Format("Opposing stacked imbalance — flattening position (was Qty: %d)!", Position.PositionQuantity);
-					sc.SetAlert(AlertSoundNum - 1, Msg);
+					stacked_buy_found = true;
+					stacked_buy_price = Price;
 				}
 			}
-		}
-		else
-		{
-			// Use persistent state variables to ensure we only place one trade per bar
-			int& LastTradedBar = sc.GetPersistentInt(0);
-
-			if (LastTradedBar != BarIndex && !conflicting_signal)
+			else
 			{
-				bool order_placed = false;
-				s_SCNewOrder NewOrder;
-				NewOrder.OrderQuantity = TradeQuantity;
-				NewOrder.OrderType = SCT_ORDERTYPE_MARKET;
-				NewOrder.TimeInForce = SCT_TIF_GOOD_TILL_CANCELED;
-				NewOrder.TextTag = "stacked_imbalance";
+				consecutive_buy_count = 0;
+			}
 
-				// Define bracket offsets
-				if (StopTicks > 0)
+			if (sell_imbalances[PriceIndex])
+			{
+				consecutive_sell_count++;
+				if (consecutive_sell_count >= StackedCount)
 				{
-					NewOrder.Stop1Offset = StopTicks * sc.TickSize;
-					NewOrder.AttachedOrderStop1Type = SCT_ORDERTYPE_STOP;
+					stacked_sell_found = true;
+					stacked_sell_price = Price;
 				}
-				if (TargetTicks > 0)
-				{
-					NewOrder.Target1Offset = TargetTicks * sc.TickSize;
-					NewOrder.AttachedOrderTarget1Type = SCT_ORDERTYPE_LIMIT;
-				}
+			}
+			else
+			{
+				consecutive_sell_count = 0;
+			}
+		}
 
-				if (stacked_buy_found)
+		// Update study subgraphs for visualization
+		if (stacked_buy_found)
+		{
+			sc.Subgraph[0][BarIndex] = static_cast<float>(stacked_buy_price);
+		}
+		if (stacked_sell_found)
+		{
+			sc.Subgraph[1][BarIndex] = static_cast<float>(stacked_sell_price);
+		}
+
+		// Section 3 - Automated Order Placement
+		// Only trade on the real-time active bar
+		if (BarIndex == sc.ArraySize - 1)
+		{
+			bool conflicting_signal = stacked_buy_found && stacked_sell_found;
+			s_SCPositionData Position;
+			sc.GetTradePosition(Position);
+
+			if (Position.PositionQuantity != 0)
+			{
+				bool exit_long = (Position.PositionQuantity > 0) && stacked_sell_found;
+				bool exit_short = (Position.PositionQuantity < 0) && stacked_buy_found;
+
+				if (!conflicting_signal && (exit_long || exit_short))
 				{
 					if (EnableTrading)
 					{
-						sc.BuyEntry(NewOrder);
+						sc.FlattenPosition();
 					}
-					
-					if (AlertSoundNum > 0)
-					{
-						SCString Msg;
-						Msg.Format("Stacked Buying Imbalance Signal Triggered at price %s (Qty: %d)!", sc.FormatGraphValue(stacked_buy_price, sc.ValueFormat).GetChars(), TradeQuantity);
-						sc.SetAlert(AlertSoundNum - 1, Msg);
-					}
-					order_placed = true;
-				}
-				else if (stacked_sell_found)
-				{
-					if (EnableTrading)
-					{
-						sc.SellEntry(NewOrder);
-					}
-					
-					if (AlertSoundNum > 0)
-					{
-						SCString Msg;
-						Msg.Format("Stacked Selling Imbalance Signal Triggered at price %s (Qty: %d)!", sc.FormatGraphValue(stacked_sell_price, sc.ValueFormat).GetChars(), TradeQuantity);
-						sc.SetAlert(AlertSoundNum - 1, Msg);
-					}
-					order_placed = true;
-				}
 
-				if (order_placed)
+					if (AlertSoundNum > 0)
+					{
+						SCString Msg;
+						Msg.Format("Opposing stacked imbalance — flattening position (was Qty: %d)!", Position.PositionQuantity);
+						sc.SetAlert(AlertSoundNum - 1, Msg);
+					}
+				}
+			}
+			else
+			{
+				int& LastTradedBar = sc.GetPersistentInt(0);
+
+				if (LastTradedBar != BarIndex && !conflicting_signal)
 				{
-					LastTradedBar = BarIndex; // Flag that trade was executed on this bar
+					bool order_placed = false;
+					s_SCNewOrder NewOrder;
+					NewOrder.OrderQuantity = TradeQuantity;
+					NewOrder.OrderType = SCT_ORDERTYPE_MARKET;
+					NewOrder.TimeInForce = SCT_TIF_GOOD_TILL_CANCELED;
+					NewOrder.TextTag = "stacked_imbalance";
+
+					if (StopTicks > 0)
+					{
+						NewOrder.Stop1Offset = StopTicks * sc.TickSize;
+						NewOrder.AttachedOrderStop1Type = SCT_ORDERTYPE_STOP;
+					}
+					if (TargetTicks > 0)
+					{
+						NewOrder.Target1Offset = TargetTicks * sc.TickSize;
+						NewOrder.AttachedOrderTarget1Type = SCT_ORDERTYPE_LIMIT;
+					}
+
+					if (stacked_buy_found)
+					{
+						if (EnableTrading)
+						{
+							sc.BuyEntry(NewOrder);
+						}
+						
+						if (AlertSoundNum > 0)
+						{
+							SCString Msg;
+							Msg.Format("Stacked Buying Imbalance Signal Triggered at price %s (Qty: %d)!", sc.FormatGraphValue(stacked_buy_price, sc.ValueFormat).GetChars(), TradeQuantity);
+							sc.SetAlert(AlertSoundNum - 1, Msg);
+						}
+						order_placed = true;
+					}
+					else if (stacked_sell_found)
+					{
+						if (EnableTrading)
+						{
+							sc.SellEntry(NewOrder);
+						}
+						
+						if (AlertSoundNum > 0)
+						{
+							SCString Msg;
+							Msg.Format("Stacked Selling Imbalance Signal Triggered at price %s (Qty: %d)!", sc.FormatGraphValue(stacked_sell_price, sc.ValueFormat).GetChars(), TradeQuantity);
+							sc.SetAlert(AlertSoundNum - 1, Msg);
+						}
+						order_placed = true;
+					}
+
+					if (order_placed)
+					{
+						LastTradedBar = BarIndex;
+					}
 				}
 			}
 		}
