@@ -144,6 +144,10 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 
 	// Section 2 - Data Processing
 	
+	// Safety check to ensure there is at least one bar loaded
+	if (sc.ArraySize < 1)
+		return;
+
 	// Verify that Volume-At-Price (VAP) data is available
 	if (static_cast<int>(sc.VolumeAtPriceForBars->GetNumberOfBars()) < sc.ArraySize)
 		return;
@@ -229,7 +233,7 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 
 	// Find the start index for our calculation loop (MaxDays back)
 	int StartIndex = 0;
-	if (MaxDays > 0)
+	if (MaxDays > 0 && sc.ArraySize > 0)
 	{
 		SCDateTimeMS StartDateTime = sc.BaseDateTimeIn[sc.ArraySize - 1];
 		StartDateTime.SubtractDays(MaxDays);
