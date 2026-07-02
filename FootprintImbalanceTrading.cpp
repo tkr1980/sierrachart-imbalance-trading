@@ -266,10 +266,15 @@ SCSFExport scsf_FootprintImbalanceTrading(SCStudyInterfaceRef sc)
 		}
 	}
 
-	// Explicitly clear all potential drawings for this bar from previous calculations
-	for (int Offset = 0; Offset < MaxDrawingOffsets; ++Offset)
+	// Explicitly clear all potential drawings for this bar from previous calculations.
+	// CRITICAL PERFORMANCE OPTIMIZATION: Only run the deletion loop on the active real-time bar (where footprint changes tick-by-tick).
+	// Running this on thousands of historical bars during full recalculations freezes the UI thread.
+	if (BarIndex == sc.ArraySize - 1)
 	{
-		sc.DeleteUserDrawnACSDrawing(sc.ChartNumber, BaseLineNum + (BarIndex * MaxDrawingOffsets) + Offset);
+		for (int Offset = 0; Offset < MaxDrawingOffsets; ++Offset)
+		{
+			sc.DeleteUserDrawnACSDrawing(sc.ChartNumber, BaseLineNum + (BarIndex * MaxDrawingOffsets) + Offset);
+		}
 	}
 
 	int PriceLevels = sc.VolumeAtPriceForBars->GetSizeAtBarIndex(BarIndex);
